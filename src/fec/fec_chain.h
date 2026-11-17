@@ -37,7 +37,12 @@ public:
     void reset();
 
 private:
-    void handle_cadu(const Cadu& c, std::vector<std::vector<uint8_t>>& payloads);
+    struct CatuOut {
+        int  state = 0;      // 0 short, 1 good, 2 uncorrectable
+        int  corrected = 0;
+        std::vector<uint8_t> payload;
+    };
+    void handle_cadu(const Cadu& c, CatuOut& out) const;
 
     Viterbi      viterbi_;
     Deframer     deframer_;
@@ -61,6 +66,7 @@ private:
     std::vector<uint8_t> hard_;     // Viterbi output, one bit per byte
     std::vector<int8_t>  bits_;     // +-1 for the ASM correlator
     std::vector<Cadu>    cadus_;
+    std::vector<CatuOut> catu_;
     FecStats st_;
 };
 

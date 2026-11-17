@@ -4,7 +4,10 @@
 #include <immintrin.h>
 #endif
 
+#include <algorithm>
 #include <cmath>
+
+#include "core/parallel.h"
 
 namespace eu {
 
@@ -14,7 +17,6 @@ double kaiser_beta(double atten_db) {
     return 0.1102 * (atten_db - 8.7);
 }
 
-// Zeroth-order modified Bessel, series form.
 static double bessel_i0(double x) {
     double sum = 1.0, term = 1.0;
     const double q = x * x / 4.0;
@@ -98,7 +100,7 @@ void Fir::process(const cf* in, cf* out, size_t n) {
     }
     if (trev_.size() != nt) {
         trev_.assign(taps_.rbegin(), taps_.rend());
-        // Tap stored twice so a complex sample times a real tap is one FMA.
+        // Tap stored twice: complex sample times real tap is one FMA.
         taps2_.resize(nt * 2);
         for (size_t j = 0; j < nt; ++j) {
             taps2_[2 * j] = taps_[nt - 1 - j];
@@ -113,41 +115,57 @@ void Fir::process(const cf* in, cf* out, size_t n) {
     std::memcpy(hb_.data() + hist, in, n * sizeof(cf));
 
     const cf* t = trev_.data();
-    for (size_t i = 0; i < n; ++i) {
-        const cf* w = hb_.data() + i;
+    const cf* hb = hb_.data();
+    const float* tf = taps2_.data();
+    auto run = [&](size_t i0, size_t i1) {
+        for (size_t i = i0; i < i1; ++i) {
+            const cf* w = hb + i;
 #if defined(__AVX2__)
-        const float* wf = reinterpret_cast<const float*>(w);
-        const float* tf = taps2_.data();
-        __m256 acc = _mm256_setzero_ps();
-        size_t j = 0;
-        for (; j + 4 <= nt; j += 4)
-            acc = _mm256_fmadd_ps(_mm256_loadu_ps(wf + 2 * j), _mm256_loadu_ps(tf + 2 * j), acc);
-        // Lanes [r0,i0,r1,i1,...]: fold to one complex value.
-        __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
-        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-        float re = _mm_cvtss_f32(s);
-        float im = _mm_cvtss_f32(_mm_shuffle_ps(s, s, 0x55));
-        for (; j < nt; ++j) {
-            re += w[j].real() * t[j].real();
-            im += w[j].imag() * t[j].real();
-        }
-        out[i] = cf(re, im);
+            const float* wf = reinterpret_cast<const float*>(w);
+            __m256 acc = _mm256_setzero_ps();
+            size_t j = 0;
+            for (; j + 4 <= nt; j += 4)
+                acc = _mm256_fmadd_ps(_mm256_loadu_ps(wf + 2 * j), _mm256_loadu_ps(tf + 2 * j), acc);
+            // Lanes [r0,i0,r1,i1,...] fold to one complex value.
+            __m128 sv = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+            sv = _mm_add_ps(sv, _mm_movehl_ps(sv, sv));
+            float re = _mm_cvtss_f32(sv);
+            float im = _mm_cvtss_f32(_mm_shuffle_ps(sv, sv, 0x55));
+            for (; j < nt; ++j) {
+                re += w[j].real() * t[j].real();
+                im += w[j].imag() * t[j].real();
+            }
+            out[i] = cf(re, im);
 #else
-        float ar0 = 0.0f, ai0 = 0.0f, ar1 = 0.0f, ai1 = 0.0f;
-        float ar2 = 0.0f, ai2 = 0.0f, ar3 = 0.0f, ai3 = 0.0f;
-        size_t j = 0;
-        for (; j + 4 <= nt; j += 4) {
-            ar0 += w[j].real() * t[j].real();         ai0 += w[j].imag() * t[j].real();
-            ar1 += w[j + 1].real() * t[j + 1].real(); ai1 += w[j + 1].imag() * t[j + 1].real();
-            ar2 += w[j + 2].real() * t[j + 2].real(); ai2 += w[j + 2].imag() * t[j + 2].real();
-            ar3 += w[j + 3].real() * t[j + 3].real(); ai3 += w[j + 3].imag() * t[j + 3].real();
-        }
-        for (; j < nt; ++j) {
-            ar0 += w[j].real() * t[j].real();
-            ai0 += w[j].imag() * t[j].real();
-        }
-        out[i] = cf((ar0 + ar1) + (ar2 + ar3), (ai0 + ai1) + (ai2 + ai3));
+            float ar0 = 0.0f, ai0 = 0.0f, ar1 = 0.0f, ai1 = 0.0f;
+            float ar2 = 0.0f, ai2 = 0.0f, ar3 = 0.0f, ai3 = 0.0f;
+            size_t j = 0;
+            for (; j + 4 <= nt; j += 4) {
+                ar0 += w[j].real() * t[j].real();         ai0 += w[j].imag() * t[j].real();
+                ar1 += w[j + 1].real() * t[j + 1].real(); ai1 += w[j + 1].imag() * t[j + 1].real();
+                ar2 += w[j + 2].real() * t[j + 2].real(); ai2 += w[j + 2].imag() * t[j + 2].real();
+                ar3 += w[j + 3].real() * t[j + 3].real(); ai3 += w[j + 3].imag() * t[j + 3].real();
+            }
+            for (; j < nt; ++j) {
+                ar0 += w[j].real() * t[j].real();
+                ai0 += w[j].imag() * t[j].real();
+            }
+            out[i] = cf((ar0 + ar1) + (ar2 + ar3), (ai0 + ai1) + (ai2 + ai3));
 #endif
+        }
+    };
+    // Each output reads a disjoint window, so the range splits cleanly.
+    const size_t kMin = 16384;
+    const int nch = n >= kMin ? (int)std::min<size_t>(thread_count(), (n + kMin - 1) / kMin) : 1;
+    if (nch <= 1) {
+        run(0, n);
+    } else {
+        const size_t step = (n + (size_t)nch - 1) / (size_t)nch;
+        parallel_for(nch, [&](int c) {
+            const size_t i0 = (size_t)c * step;
+            const size_t i1 = std::min(n, i0 + step);
+            if (i0 < i1) run(i0, i1);
+        });
     }
 
     std::memcpy(hist_.data(), hb_.data() + n, hist * sizeof(cf));

@@ -6,13 +6,13 @@
 
 namespace eu {
 
-// RRC, span symbols each side, unity DC gain so +-1 in gives +-1 at decision.
+// RRC, unity DC gain so +-1 in gives +-1 at decision.
 std::vector<float> design_rrc(double alpha, int sps, int span);
 
 // Cutoff in cycles/sample (0..0.5).
 std::vector<float> design_lowpass(double cutoff, int ntaps, double beta);
 
-// Kaiser beta for a stopband attenuation (dB).
+// Kaiser beta for a stopband attenuation.
 double kaiser_beta(double atten_db);
 
 class Fir {

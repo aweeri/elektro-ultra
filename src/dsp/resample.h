@@ -1,4 +1,3 @@
-// Streaming DSP primitives and the coarse frequency acquisition that feeds PLL.
 #pragma once
 
 #include <vector>
@@ -17,6 +16,7 @@ public:
 private:
     double r_;
     cf z_{0, 0};
+    std::vector<cf> scratch_;
 };
 
 class Nco {
@@ -24,7 +24,7 @@ public:
     void set_freq_hz(double f, double fs) { df_ = 2.0 * M_PI * f / fs; }
     void set_phase(double p) { phase_ = p; }
     double freq_hz(double fs) const { return df_ * fs / (2.0 * M_PI); }
-    // out = in * exp(-j*theta); out may alias in.
+    // out may alias in.
     void process(const cf* in, cf* out, size_t n);
     void reset() { phase_ = 0.0; }
 
@@ -33,7 +33,7 @@ private:
     double phase_ = 0.0;
 };
 
-// L/M polyphase resampler, output rate exactly fs_in*L/M.
+// L/M polyphase resampler; exact rate fs_in*L/M.
 class Resampler {
 public:
     // atten_db: stopband target; span: zero crossings each side.
@@ -61,7 +61,7 @@ private:
 // Running-RMS AGC: keeps decision thresholds meaningful on captures whose level varies 40 dB between recordings (rms -29 to -46 dBFS).
 class Agc {
 public:
-    // tau_samples: power-averaging time constant in samples.
+    // tau_samples: power-averaging time constant.
     void configure(double tau_samples, double target_rms = 1.0);
     void process(const cf* in, cf* out, size_t n);
     void reset() { p_ = 0.0; primed_ = false; }
@@ -73,7 +73,7 @@ private:
     bool primed_ = false;
 };
 
-// Cubic (Catmull-Rom) fractional delay over a ring of complex samples.
+// Catmull-Rom fractional delay over a ring.
 class FracDelay {
 public:
     void reset(size_t n = 64) { buf_.assign(n, cf(0, 0)); pos_ = 0; n_ = n; }
@@ -81,7 +81,7 @@ public:
         buf_[pos_] = v;
         pos_ = (pos_ + 1) % n_;
     }
-    // Value at t samples before the newest sample; t in [0, n_-3).
+    // Value t samples before the newest; t in [0, n_-3).
     cf at(double t) const;
 
 private:
@@ -93,7 +93,7 @@ private:
 double acquire_carrier(const cf* x, size_t n, double fs, double offset_guess,
                        int order, double search_hz, double& strength_db);
 
-// Band centroid from the averaged PSD, restricted to +-search_hz.
+// Band centroid from the averaged PSD, within +-search_hz.
 double band_centroid(const cf* x, size_t n, double fs, double search_hz,
                      double* width_hz = nullptr);
 

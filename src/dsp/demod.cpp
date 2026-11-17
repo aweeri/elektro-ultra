@@ -57,6 +57,7 @@ void DemodChain::init_loops() {
     agc_p_ = 0.0;
     agc_g_ = 1.0;
     qpos_ = 0;
+    prev_tail_.assign(16, cf(0, 0));
     evm_acc_ = 0.0;
     evm_n_ = 0;
     const_.clear();
@@ -92,7 +93,7 @@ bool DemodChain::configure(const DemodConfig& cfg, double fs_in, std::string* er
     qd_ = (cfg.mod == Mod::Oqpsk && cfg.oqpsk_align) ? cfg.sps / 2 : 0;
     qdelay_.assign((size_t)std::max(qd_, 1), 0.0f);
 
-    dl_.reset(64);
+    prev_tail_.assign(16, cf(0, 0));
     pending_.clear();
     init_loops();
     ok_ = true;
@@ -122,7 +123,7 @@ void DemodChain::prime_and_process(std::vector<int8_t>& out) {
     const size_t n = pending_.size();
     if (n < 8192) return;
 
-    // DC-blocked copy: LO leakage is 40+ dB above the signal on the cs8 captures.
+    // DC-blocked copy: LO leakage is 40+ dB above the signal on cs8.
     b1_.resize(n);
     std::memcpy(b1_.data(), pending_.data(), n * sizeof(cf));
     dc_.process(b1_.data(), b1_.data(), n);
@@ -137,7 +138,7 @@ void DemodChain::prime_and_process(std::vector<int8_t>& out) {
     const double acq_span = std::max(5000.0, std::min(cfg_.search_hz, 0.6 * fs_in_));
     double fine = acquire_carrier(b1_.data(), n, fs_in_, 0.0, order, order * acq_span, strength);
     if (strength < 6.0) {
-        // No convincing line (common for OQPSK): the centroid beats a noise peak.
+        // No convincing line (common for OQPSK): centroid beats a noise peak.
         fine = cen;
     }
 
@@ -258,8 +259,7 @@ void DemodChain::run_block(const cf* x, size_t n, std::vector<int8_t>& out) {
             const double off = (double)k / (double)step_div;
             double acc = 0.0;
             size_t cnt = 0;
-            for (double p = off; p + 1.0 < (double)N;
-                 p += (double)cfg_.sps) {
+            for (double p = off; p + 1.0 < (double)N; p += (double)cfg_.sps) {
                 const size_t i = (size_t)p;
                 const float f = (float)(p - (double)i);
                 const cf v = b2_[i] * (1.0f - f) + b2_[i + 1] * f;
@@ -278,101 +278,132 @@ void DemodChain::run_block(const cf* x, size_t n, std::vector<int8_t>& out) {
 
     const double mid = sps * 0.5;
     const float scale = (float)cfg_.soft_scale;
+    const bool dbg = std::getenv("EU_DEMOD_DEBUG") != nullptr;
 
-    for (size_t i = 0; i < b2_.size(); ++i) {
-        dl_.push(b2_[i]);
-        ++n_pushed_;
+    // Contiguous history: the ring buffer spent a modulo per sample, which cost more than the filters it fed.
+    const size_t hist = prev_tail_.size();
+    b3_.resize(hist + b2_.size());
+    if (hist) std::memcpy(b3_.data(), prev_tail_.data(), hist * sizeof(cf));
+    if (!b2_.empty()) std::memcpy(b3_.data() + hist, b2_.data(), b2_.size() * sizeof(cf));
+    const long long base_abs = n_pushed_ - (long long)hist;
+    const long long nmax = (long long)b3_.size() - 1;
 
-        while (t_next_ <= (double)(n_pushed_ - 3)) {
-            const double d = (double)(n_pushed_ - 1) - t_next_;
-            if (d < 0.0) break;
-            const cf y = dl_.at(d);
-            const cf ymid = dl_.at(d + mid);
+    auto sample_at = [&](double t) -> cf {
+        const long long a = (long long)std::floor(t);
+        const double u = t - (double)a;
+        long long k = a - base_abs;
+        auto g = [&](long long off) -> cf {
+            long long j = k + off;
+            if (j < 0) j = 0;
+            if (j > nmax) j = nmax;
+            return b3_[(size_t)j];
+        };
+        const cf xm1 = g(-1), x0 = g(0), x1 = g(1), x2 = g(2);
+        const cf bb = x1 - xm1;
+        const cf cc = xm1 * 2.0f - x0 * 5.0f + x1 * 4.0f - x2;
+        const cf dd = -xm1 + x0 * 3.0f - x1 * 3.0f + x2;
+        const float uf = (float)u;
+        return 0.5f * (x0 * 2.0f + bb * uf + cc * uf * uf + dd * uf * uf * uf);
+    };
 
-            // Normalised by local power so the loop gain is AGC independent.
-            double e_dbg = 0.0;
-            if (have_prev_) {
-                const cf diff = y - y_prev_;
-                const double e = (diff * std::conj(ymid)).real() /
-                                 (std::norm(y) + std::norm(ymid) + 1e-12);
-                e_dbg = e;
-                tim_integ_ += ki_t_ * e;
-                const double corr = kp_t_ * e + tim_integ_;
-                corr_sum_ += corr;
-                ++corr_n_;
-                // e > 0 means the sample is late (past the eye centre).
-                t_next_ += sps - corr;
-            } else {
-                t_next_ += sps;
-            }
-            y_prev_ = y;
-            have_prev_ = true;
+    out.reserve(out.size() + b2_.size() / (size_t)cfg_.sps * 4 + 64);
 
-
-            // Measured on the derotated symbol: on the raw one the loop tracks the absolute phase and never settles.
-            cf sym = y * cf((float)std::cos(phase_), (float)-std::sin(phase_));
-            double pe = 0.0;
-            if (cfg_.mod == Mod::Bpsk) {
-                const double re = sym.real(), im = sym.imag();
-                const double sgn = (re >= 0.0) ? 1.0 : -1.0;
-                pe = (sgn * im) / (re * re + im * im + 1e-12);
-            } else {
-                const double re = sym.real(), im = sym.imag();
-                const double sr = (re >= 0.0) ? 1.0 : -1.0;
-                const double si = (im >= 0.0) ? 1.0 : -1.0;
-                pe = (sr * im - si * re) / (std::fabs(re) + std::fabs(im) + 1e-12);
-            }
-            // Wide loop to acquire, narrow to track; the integrator carries the frequency estimate across the switch.
-            const bool acq = st_.symbols < (uint64_t)cfg_.acq_symbols;
-            const double kp = acq ? kp_ca_ : kp_c_;
-            const double ki = acq ? ki_ca_ : ki_c_;
-            integ_ += ki * pe;
-            phase_ = wrap_pi(phase_ + integ_ + kp * pe);
-
-            static const bool dbg = std::getenv("EU_DEMOD_DEBUG") != nullptr;
-            if (dbg && st_.symbols < 6000 && (st_.symbols % 500) == 0) {
-                std::fprintf(stderr,
-                             "sym %llu t=%.3f d=%.3f e=%+.4f |y|=%.3f |mid|=%.3f "
-                             "ph=%+.3f sym=%+.3f%+.3fj\n",
-                             (unsigned long long)st_.symbols, t_next_, d, e_dbg,
-                             std::abs(y), std::abs(ymid), phase_,
-                             sym.real(), sym.imag());
-            }
-            ++st_.symbols;
-
-            if (st_.symbols > 200) {
-                double dr = 0.0, di = 0.0;
-                if (cfg_.mod == Mod::Bpsk) {
-                    dr = (sym.real() >= 0.0) ? 1.0 : -1.0;
-                } else {
-                    dr = (sym.real() >= 0.0) ? 0.70710678 : -0.70710678;
-                    di = (sym.imag() >= 0.0) ? 0.70710678 : -0.70710678;
-                }
-                // M2M4 is what SatDump reports as "SNR"; keeping it lets the two readouts be compared.
-                {
-                    const double p2 = std::norm(sym);
-                    m2_acc_ += p2;
-                    m4_acc_ += p2 * p2;
-                }
-                const double er = sym.real() * evm_norm_ - dr;
-                const double ei = sym.imag() * evm_norm_ - di;
-                evm_acc_ += er * er + ei * ei;
-                evm_n_ += 1.0;
-                if (const_.size() < 4096) const_.push_back(sym);
-                else { const_[const_pos_] = sym; const_pos_ = (const_pos_ + 1) % 4096; }
-            }
-
-            // Scale 100 leaves headroom in int8 for the branch metrics.
-            if (cfg_.mod == Mod::Bpsk) {
-                const float v = clampf(sym.real() * scale, -127.0f, 127.0f);
-                out.push_back((int8_t)std::lround(v));
-            } else {
-                const float vi = clampf(sym.real() * scale, -127.0f, 127.0f);
-                const float vq = clampf(sym.imag() * scale, -127.0f, 127.0f);
-                out.push_back((int8_t)std::lround(vi));
-                out.push_back((int8_t)std::lround(vq));
-            }
+    // Sample by sample the timing loop is a no-op until t_next_ is reachable, so jump straight to the sample it needs.
+    size_t i = 0;
+    const size_t nb = b2_.size();
+    while (i < nb) {
+        const long long cur = n_pushed_ + (long long)i + 1;
+        if (t_next_ > (double)(cur - 3)) {
+            long long need = (long long)std::floor(t_next_) + 3 - n_pushed_;
+            if (need <= (long long)i) need = (long long)i + 1;
+            if (need >= (long long)nb) break;
+            i = (size_t)need;
+            continue;
         }
+
+        const cf y = sample_at(t_next_);
+        const cf ymid = sample_at(t_next_ - mid);
+
+        // Normalised by local power: loop gain is AGC independent.
+        if (have_prev_) {
+            const cf diff = y - y_prev_;
+            const double e = (diff * std::conj(ymid)).real() /
+                             (std::norm(y) + std::norm(ymid) + 1e-12);
+            tim_integ_ += ki_t_ * e;
+            const double corr = kp_t_ * e + tim_integ_;
+            corr_sum_ += corr;
+            ++corr_n_;
+            t_next_ += sps - corr;   // e > 0 means the sample is late
+        } else {
+            t_next_ += sps;
+        }
+        y_prev_ = y;
+        have_prev_ = true;
+
+        // Measured on the derotated symbol: on the raw one the loop tracks the absolute phase and never settles.
+        double sn = 0.0, cs = 1.0;
+        ::sincos(phase_, &sn, &cs);
+        const cf rot((float)cs, (float)-sn);
+        const cf sym = y * rot;
+        double pe = 0.0;
+        const double re = sym.real(), im = sym.imag();
+        if (cfg_.mod == Mod::Bpsk) {
+            const double sgn = (re >= 0.0) ? 1.0 : -1.0;
+            pe = (sgn * im) / (re * re + im * im + 1e-12);
+        } else {
+            const double sr = (re >= 0.0) ? 1.0 : -1.0;
+            const double si = (im >= 0.0) ? 1.0 : -1.0;
+            pe = (sr * im - si * re) / (std::fabs(re) + std::fabs(im) + 1e-12);
+        }
+        // Wide loop to acquire, narrow to track; the integrator carries the frequency estimate across the switch.
+        const bool acq = st_.symbols < (uint64_t)cfg_.acq_symbols;
+        const double kp = acq ? kp_ca_ : kp_c_;
+        const double ki = acq ? ki_ca_ : ki_c_;
+        integ_ += ki * pe;
+        phase_ = wrap_pi(phase_ + integ_ + kp * pe);
+
+        if (dbg && st_.symbols < 6000 && (st_.symbols % 500) == 0) {
+            std::fprintf(stderr, "sym %llu t=%.3f |y|=%.3f |mid|=%.3f ph=%+.3f sym=%+.3f%+.3fj\n",
+                         (unsigned long long)st_.symbols, t_next_, std::abs(y), std::abs(ymid),
+                         phase_, sym.real(), sym.imag());
+        }
+        ++st_.symbols;
+
+        if (st_.symbols > 200) {
+            double dr = 0.0, di = 0.0;
+            if (cfg_.mod == Mod::Bpsk) {
+                dr = (re >= 0.0) ? 1.0 : -1.0;
+            } else {
+                dr = (re >= 0.0) ? 0.70710678 : -0.70710678;
+                di = (im >= 0.0) ? 0.70710678 : -0.70710678;
+            }
+            // M2M4 is what SatDump reports as "SNR"; keeping it lets the two readouts be compared.
+            const double p2 = std::norm(sym);
+            m2_acc_ += p2;
+            m4_acc_ += p2 * p2;
+            const double er = re * evm_norm_ - dr;
+            const double ei = im * evm_norm_ - di;
+            evm_acc_ += er * er + ei * ei;
+            evm_n_ += 1.0;
+            if (const_.size() < 4096) const_.push_back(sym);
+            else { const_[const_pos_] = sym; const_pos_ = (const_pos_ + 1) % 4096; }
+        }
+
+        // Scale 100 leaves headroom in int8 for the branch metrics.
+        if (cfg_.mod == Mod::Bpsk) {
+            out.push_back((int8_t)std::lround(clampf(sym.real() * scale, -127.0f, 127.0f)));
+        } else {
+            out.push_back((int8_t)std::lround(clampf(re * scale, -127.0f, 127.0f)));
+            out.push_back((int8_t)std::lround(clampf(im * scale, -127.0f, 127.0f)));
+        }
+    }
+
+    n_pushed_ += (long long)nb;
+    if (!b3_.empty()) {
+        const size_t keep = std::min(hist, b3_.size());
+        std::memcpy(prev_tail_.data(), b3_.data() + b3_.size() - keep, keep * sizeof(cf));
+        if (keep < hist)
+            std::fill(prev_tail_.begin(), prev_tail_.begin() + (long)(hist - keep), cf(0, 0));
     }
 
     if (evm_n_ > 0) {

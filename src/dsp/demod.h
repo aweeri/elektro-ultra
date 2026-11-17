@@ -69,6 +69,7 @@ private:
     void prime_and_process(std::vector<int8_t>& out);
     void run_block(const cf* x, size_t n, std::vector<int8_t>& out);
     void init_loops();
+    cf   tap_at(double t) const;
 
     DemodConfig cfg_;
     double fs_in_ = 0.0, fs_out_ = 0.0;
@@ -85,7 +86,10 @@ private:
     size_t qpos_ = 0;
     int    qd_ = 0;
 
-    FracDelay dl_;
+    // Block plus the previous tail, so the timing loop indexes directly instead of pushing a ring buffer.
+    std::vector<cf> b3_;        // prev_tail_ + this block, indexed by absolute sample
+    std::vector<cf> prev_tail_;
+    long long       base_off_ = 0;
     double t_next_ = 0.0;
     long long n_pushed_ = 0;
     cf     y_prev_{0, 0};
@@ -100,7 +104,7 @@ private:
     double kp_c_ = 0.0, ki_c_ = 0.0;
     double kp_ca_ = 0.0, ki_ca_ = 0.0;
 
-    std::vector<cf>     b1_, b2_, b3_, pending_;
+    std::vector<cf>     b1_, b2_, pending_;
     std::vector<int8_t> dummy_;
     std::vector<cf>     const_;
     size_t              const_pos_ = 0;
