@@ -32,7 +32,7 @@ parameters: 280 000 Bd -> 280 000 Bd, 294 000 Bd -> 293 999 Bd.
 | EVM | 30.9 % | 31.4 % |
 | carrier | +1418.7 Hz | +1417.2 Hz |
 | clock (measured) | +2.4 ppm | +4.7 ppm |
-| throughput | 8.0x realtime | 8.9x realtime |
+| throughput | 15.0x realtime | 21.8x realtime |
 
 `EU_PROFILE=1` prints per-stage DSP time (dc, nco, resample, rrc, rail, agc);
 that is how the 1.55x speedup below was found instead of guessed.
@@ -46,6 +46,48 @@ The gap between the file-average CADU rate (16.3/s) and the nominal 17.9/s is
 would show up as RS failures and broken images, and there are none. The ziq
 capture, recorded with a different recorder, sits at 17.1/s, which supports the
 same reading.
+
+## Throughput
+
+Same captures, same bit-exact output (4175/4175 CADUs, 0 RS corrections, stitched
+disks still correlate r = 1.000000 with GobDump), 256.1 s of IQ:
+
+| stage | before | after |
+|---|---|---|
+| dc | 1.79 s | 1.79 s |
+| nco | 2.07 s | 1.45 s |
+| resample | 5.55 s | 3.36 s |
+| rrc | 3.22 s | 2.13 s |
+| agc | 0.40 s | 0.42 s |
+| symbol loop | 11.5 s | 5.1 s |
+| fec + transport | 5.9 s | overlapped |
+| **total** | **33.3 s (8.3x)** | **17.1 s (15.0x)** |
+
+What each change bought:
+
+- **The symbol loop was spending more on `% 64` than on the filters.** The timing
+  loop pushed every resampled sample into a 64-entry ring and indexed it four
+  times per symbol with a modulo. It now indexes a contiguous block buffer
+  directly, jumping sample to sample instead of checking every one.
+- **Closed-form resampler positions.** Output `t` sits at
+  `base0 + floor((ph0 + t*M)/L)` with phase `(ph0 + t*M) % L`, so the whole
+  output range is addressable up front and splits across threads without any
+  cross-chunk state.
+- **Block-parallel FIR and NCO.** Each RRC output reads a disjoint window of the
+  history buffer, so the range splits with no locking. The NCO phase is analytic
+  in the sample index, so a chunk starts exactly with one `cos`/`sin`.
+- **FEC off the critical path.** Frames are independent once deframed, so
+  derandomise + RS decode runs across the pool, and the whole FEC stage runs on
+  its own thread behind the demod.
+- **Thread count follows the cgroup quota.** `nproc` reports 6 here but
+  `cpu.max` grants 2 CPUs; six worker threads against a 2-CPU CFS quota throttle
+  the entire process and ran *slower* than two.
+
+Two concurrency bugs found while getting this working, both worth writing down:
+a worker could pick up a work item after the generation changed and call the
+previous generation's `std::function`, and two threads calling `parallel_for`
+concurrently clobbered the pool's shared generation state (this deadlocked the
+ziq path, which runs FEC on one thread and the demod on another).
 
 ## Products
 

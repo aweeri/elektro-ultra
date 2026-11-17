@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "core/common.h"
+#include "core/parallel.h"
 
 namespace eu {
 
@@ -86,9 +87,23 @@ void FecChain::push(const int8_t* soft, size_t n,
     cadus_.clear();
     deframer_.push(bits_.data(), bits_.size(), cadus_);
 
-    for (const Cadu& c : cadus_) {
-        // emit() already flips every bit of a frame that only matched the inverted ASM, so c.bytes is always normal; negating here re-inverts already-corrected frames.
-        handle_cadu(c, payloads);
+    // Frames are independent once deframed, so derandomise + RS decode splits across threads.
+    if (!cadus_.empty()) {
+        const int nc = (int)cadus_.size();
+        catu_.assign((size_t)nc, CatuOut{});
+        if (nc == 1) handle_cadu(cadus_[0], catu_[0]);
+        else parallel_for(nc, [&](int k) { handle_cadu(cadus_[(size_t)k], catu_[(size_t)k]); });
+        for (int k = 0; k < nc; ++k) {
+            CatuOut& r = catu_[(size_t)k];
+            ++st_.cadus;
+            if (r.state == 1) {
+                st_.rs_corrected += (uint64_t)r.corrected;
+                ++st_.cadus_good;
+                payloads.push_back(std::move(r.payload));
+            } else if (r.state == 2) {
+                ++st_.rs_failed;
+            }
+        }
     }
 
     // No frame sync in a full window means the loop settled on the wrong phase; walk the rotations until frames appear, then never change.
@@ -108,43 +123,36 @@ void FecChain::push(const int8_t* soft, size_t n,
     st_.asm_confidence = deframer_.mean_confidence();
 }
 
-void FecChain::handle_cadu(const Cadu& c,
-                           std::vector<std::vector<uint8_t>>& payloads) {
-    ++st_.cadus;
+void FecChain::handle_cadu(const Cadu& c, CatuOut& out) const {
+    out.state = 0;
+    out.corrected = 0;
+    out.payload.clear();
     if ((int)c.bytes.size() < cadu_bytes_) return;
 
     std::vector<uint8_t> cadu = c.bytes;
 
     // ASM is transmitted clear.
-    if (derand_ && cadu_bytes_ > 4)
-        rand_.apply(cadu.data() + 4, (size_t)cadu_bytes_ - 4, 0);
+    if (derand_ && cadu_bytes_ > 4) rand_.apply(cadu.data() + 4, (size_t)cadu_bytes_ - 4, 0);
 
     const size_t rs_len = (size_t)cadu_bytes_ - 4;
     if (rs_depth_ <= 0 || rs_len < (size_t)rs_depth_ * ReedSolomon::kN) {
-        payloads.push_back(std::move(cadu));
-        ++st_.cadus_good;
+        out.payload = std::move(cadu);
+        out.state = 1;
         return;
     }
 
     std::vector<int> errors;
     rs_.decode_interleaved(cadu.data() + 4, rs_depth_, errors);
 
-    bool ok = true;
     int corrected = 0;
     for (int e : errors) {
-        if (e < 0) ok = false;
-        else corrected += e;
+        if (e < 0) { out.state = 2; return; }
+        corrected += e;
     }
-    if (!ok) {
-        ++st_.rs_failed;
-        return;
-    }
-    st_.rs_corrected += (uint64_t)corrected;
-    ++st_.cadus_good;
-
+    out.corrected = corrected;
+    out.state = 1;
     // 892 bytes: 6-byte VCDU header + 886 bytes of data.
-    payloads.push_back(std::vector<uint8_t>(cadu.begin() + 4,
-                                            cadu.begin() + 4 + rs_depth_ * ReedSolomon::kK));
+    out.payload.assign(cadu.begin() + 4, cadu.begin() + 4 + rs_depth_ * ReedSolomon::kK);
 }
 
 }  // namespace eu

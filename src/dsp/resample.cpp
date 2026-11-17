@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <numeric>
 
+#include "core/parallel.h"
+
 #include "core/fft.h"
 #include "dsp/filters.h"
 
@@ -19,6 +21,8 @@ void DcBlocker::process(const cf* in, cf* out, size_t n) {
         if (out != in) std::copy(in, in + n, out);
         return;
     }
+    // One-pole IIR: the recurrence is serial, and splitting it costs an extra sweep
+    // of the block that outweighed the gain.
     const float a = (float)(1.0 - r_);
     const float b = (float)r_;
     cf z = z_;
@@ -31,22 +35,39 @@ void DcBlocker::process(const cf* in, cf* out, size_t n) {
 }
 
 void Nco::process(const cf* in, cf* out, size_t n) {
-    // Recurrence, renormalised so the phasor cannot drift off the unit circle.
+    // Renormalised so the phasor cannot drift off the unit circle.
     const double c = std::cos(df_), s = std::sin(df_);
-    cf w((float)c, (float)-s);            // step for exp(-j*theta)
-    cf ph((float)std::cos(phase_), (float)-std::sin(phase_));
-    for (size_t i = 0; i < n; ++i) {
-        out[i] = in[i] * ph;
-        ph = ph * w;
-        if ((i & 0x3FF) == 0x3FF) {       // every 1024 samples, renormalise
-            const float m = std::sqrt(ph.real() * ph.real() + ph.imag() * ph.imag());
-            if (m > 0) ph = cf(ph.real() / m, ph.imag() / m);
+    const cf w((float)c, (float)-s);
+    constexpr size_t kMin = 16384;
+    const int nch = n >= kMin ? (int)std::min<size_t>(thread_count(), (n + kMin - 1) / kMin) : 1;
+    auto chunk = [&](size_t i0, size_t i1) {
+        // Phase is analytic in the sample index, so a chunk starts exactly, no warm-up.
+        double ph = phase_ + df_ * (double)i0;
+        ph -= 2.0 * kPi * std::floor(ph / (2.0 * kPi) + 0.5);
+        cf p((float)std::cos(ph), (float)-std::sin(ph));
+        for (size_t i = i0; i < i1; ++i) {
+            out[i] = in[i] * p;
+            p = p * w;
+            if ((i & 0x3FF) == 0x3FF) {
+                const float m = std::sqrt(p.real() * p.real() + p.imag() * p.imag());
+                if (m > 0) p = cf(p.real() / m, p.imag() / m);
+            }
         }
+    };
+    if (nch <= 1) {
+        chunk(0, n);
+    } else {
+        const size_t step = (n + (size_t)nch - 1) / (size_t)nch;
+        parallel_for(nch, [&](int ci) {
+            const size_t i0 = (size_t)ci * step;
+            const size_t i1 = std::min(n, i0 + step);
+            if (i0 < i1) chunk(i0, i1);
+        });
     }
-    phase_ = wrap_pi(std::atan2(-ph.imag(), ph.real()));
+    phase_ = phase_ + df_ * (double)n;
+    phase_ -= 2.0 * kPi * std::floor(phase_ / (2.0 * kPi) + 0.5);
 }
 
-// Zeroth-order modified Bessel, same definition as filters.cpp.
 static double bessel_i0(double x) {
     double sum = 1.0, term = 1.0;
     const double q = x * x / 4.0;
@@ -74,7 +95,7 @@ bool Resampler::configure(double fs_in, double fs_out, double atten_db, int span
     if (L_ > 8192 || M_ > 8192) return false;
     if (span < 4) span = 4;
 
-    // Cutoff at the lower Nyquist: what folds there is removed by the RRC.
+    // Cutoff at the lower Nyquist; the RRC removes what folds there.
     const int P = (int)((2.0 * span * std::max(L_, M_) + L_ - 1) / L_) + 1;
     P_ = P;
     const int len = L_ * P;
@@ -109,7 +130,7 @@ bool Resampler::configure(double fs_in, double fs_out, double atten_db, int span
             htab_[(size_t)ph * (size_t)P + (size_t)p] =
                 h_[(size_t)(P - 1 - p) * (size_t)L_ + (size_t)ph];
 
-    // Doubled taps so one FMA covers 4 complex samples.
+    // Doubled taps: one FMA covers 4 complex samples.
     htab2_.assign((size_t)L_ * (size_t)P * 2, 0.0f);
     for (size_t k = 0; k < (size_t)L_ * (size_t)P; ++k) {
         htab2_[2 * k] = htab_[k];
@@ -141,62 +162,109 @@ void Resampler::process(const cf* in, size_t n, std::vector<cf>& out) {
     buf_.insert(buf_.end(), in, in + n);
     n_in_ += (long long)n;
 
+    // Output t sits at base0 + floor((ph0 + t*M)/L) with phase (ph0 + t*M) % L. Closing
+    // that form means the whole output range is addressable, so it splits across threads.
     const long long P = P_;
-    auto advance = [&] {
-        phase_ += M_;
-        while (phase_ >= L_) {
-            phase_ -= L_;
-            ++base_;
-        }
-    };
-
-    for (;;) {
-        if (base_ >= n_in_) break;                 // need more input
-        if (base_ - P + 1 < buf_start_) {          // not enough history yet
-            advance();
-            continue;
-        }
-        const cf* x = &buf_[(size_t)(base_ - P + 1 - buf_start_)];
-        float re = 0.0f, im = 0.0f;
-#if defined(__AVX2__)
-        const float* xf = reinterpret_cast<const float*>(x);
-        const float* cf2 = &htab2_[(size_t)phase_ * (size_t)P * 2];
-        __m256 acc = _mm256_setzero_ps();
-        long long p = 0;
-        for (; p + 4 <= P; p += 4)
-            acc = _mm256_fmadd_ps(_mm256_loadu_ps(xf + 2 * p), _mm256_loadu_ps(cf2 + 2 * p), acc);
-        __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
-        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-        re = _mm_cvtss_f32(s);
-        im = _mm_cvtss_f32(_mm_shuffle_ps(s, s, 0x55));
-        const float* c = &htab_[(size_t)phase_ * (size_t)P];
-        for (; p < P; ++p) {
-            re += x[p].real() * c[p];
-            im += x[p].imag() * c[p];
-        }
-#else
-        const float* c = &htab_[(size_t)phase_ * (size_t)P];
-        float ar0 = 0.0f, ai0 = 0.0f, ar1 = 0.0f, ai1 = 0.0f;
-        float ar2 = 0.0f, ai2 = 0.0f, ar3 = 0.0f, ai3 = 0.0f;
-        long long p = 0;
-        for (; p + 4 <= P; p += 4) {
-            ar0 += x[p].real() * c[p];         ai0 += x[p].imag() * c[p];
-            ar1 += x[p + 1].real() * c[p + 1]; ai1 += x[p + 1].imag() * c[p + 1];
-            ar2 += x[p + 2].real() * c[p + 2]; ai2 += x[p + 2].imag() * c[p + 2];
-            ar3 += x[p + 3].real() * c[p + 3]; ai3 += x[p + 3].imag() * c[p + 3];
-        }
-        for (; p < P; ++p) {
-            ar0 += x[p].real() * c[p];
-            ai0 += x[p].imag() * c[p];
-        }
-        re = (ar0 + ar1) + (ar2 + ar3);
-        im = (ai0 + ai1) + (ai2 + ai3);
-#endif
-        out.push_back(cf(re, im));
-        advance();
+    const long long base0 = base_;
+    const long long ph0 = phase_;
+    const long long R = n_in_ - 1 - base0;
+    long long t_max = -1;
+    if (R >= 0) {
+        const long long hi = (R + 1) * (long long)L_ - ph0;
+        if (hi > 0) t_max = (hi - 1) / (long long)M_;
+    }
+    const long long S = buf_start_ + P - 1;
+    long long t_min = 0;
+    if (base0 < S) {
+        const long long need = (S - base0) * (long long)L_ - ph0;
+        t_min = need > 0 ? (need + (long long)M_ - 1) / (long long)M_ : 0;
     }
 
-    // Trim history: keep everything the next output still needs, plus margin.
+    if (t_max >= 0) {
+        const long long done = t_max + 1;
+        if (t_max >= t_min) {
+            const size_t have = out.size();
+            const long long count = t_max - t_min + 1;
+            out.resize(have + (size_t)count);
+            cf* dst = out.data() + have;
+
+            const long long a0 = ph0 + t_min * (long long)M_;
+            cf* const buf = buf_.data();
+            const long long bs = buf_start_;
+            const int L = L_, M = M_;
+            auto chunk = [&](long long t0, long long t1) {
+                long long num = ph0 + t0 * (long long)M_;
+                long long base = base0 + num / L;
+                int ph = (int)(num % L);
+                for (long long t = t0; t < t1; ++t) {
+                    const cf* x = buf + (base - P + 1 - bs);
+                    float re = 0.0f, im = 0.0f;
+#if defined(__AVX2__)
+                    const float* xf = reinterpret_cast<const float*>(x);
+                    const float* c2 = &htab2_[(size_t)ph * (size_t)P * 2];
+                    __m256 acc = _mm256_setzero_ps();
+                    long long k = 0;
+                    for (; k + 4 <= P; k += 4)
+                        acc = _mm256_fmadd_ps(_mm256_loadu_ps(xf + 2 * k), _mm256_loadu_ps(c2 + 2 * k), acc);
+                    __m128 sv = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+                    sv = _mm_add_ps(sv, _mm_movehl_ps(sv, sv));
+                    re = _mm_cvtss_f32(sv);
+                    im = _mm_cvtss_f32(_mm_shuffle_ps(sv, sv, 0x55));
+                    const float* c1 = &htab_[(size_t)ph * (size_t)P];
+                    for (; k < P; ++k) {
+                        re += x[k].real() * c1[k];
+                        im += x[k].imag() * c1[k];
+                    }
+#else
+                    const float* c1 = &htab_[(size_t)ph * (size_t)P];
+                    float ar0 = 0.0f, ai0 = 0.0f, ar1 = 0.0f, ai1 = 0.0f;
+                    float ar2 = 0.0f, ai2 = 0.0f, ar3 = 0.0f, ai3 = 0.0f;
+                    long long k = 0;
+                    for (; k + 4 <= P; k += 4) {
+                        ar0 += x[k].real() * c1[k];         ai0 += x[k].imag() * c1[k];
+                        ar1 += x[k + 1].real() * c1[k + 1]; ai1 += x[k + 1].imag() * c1[k + 1];
+                        ar2 += x[k + 2].real() * c1[k + 2]; ai2 += x[k + 2].imag() * c1[k + 2];
+                        ar3 += x[k + 3].real() * c1[k + 3]; ai3 += x[k + 3].imag() * c1[k + 3];
+                    }
+                    for (; k < P; ++k) {
+                        ar0 += x[k].real() * c1[k];
+                        ai0 += x[k].imag() * c1[k];
+                    }
+                    re = (ar0 + ar1) + (ar2 + ar3);
+                    im = (ai0 + ai1) + (ai2 + ai3);
+#endif
+                    dst[t - t_min] = cf(re, im);
+                    ph += M;
+                    while (ph >= L) {
+                        ph -= L;
+                        ++base;
+                    }
+                }
+            };
+
+            constexpr long long kMin = 8192;
+            const int nch = count >= kMin
+                                ? (int)std::min<size_t>(thread_count(),
+                                                        (size_t)((count + kMin - 1) / kMin))
+                                : 1;
+            if (nch <= 1) {
+                chunk(t_min, t_max + 1);
+            } else {
+                const long long step = (count + nch - 1) / nch;
+                parallel_for(nch, [&](int c) {
+                    const long long t0 = t_min + (long long)c * step;
+                    const long long t1 = std::min(t_max + 1, t0 + step);
+                    if (t0 < t1) chunk(t0, t1);
+                });
+            }
+            (void)a0;
+        }
+        const long long num = ph0 + done * (long long)M_;
+        base_ = base0 + num / (long long)L_;
+        phase_ = (int)(num % (long long)L_);
+        k_out_ += done;
+    }
+
     const long long keep_from = base_ - P + 1 - 16;
     if (keep_from - buf_start_ > 1 << 16) {
         const long long drop = keep_from - buf_start_;
@@ -205,7 +273,7 @@ void Resampler::process(const cf* in, size_t n, std::vector<cf>& out) {
     }
 }
 
-// Running-power normaliser, per block, so one sqrt per block not per sample.
+// Per-block power normaliser: one sqrt per block, not per sample.
 void Agc::configure(double tau_samples, double target_rms) {
     if (tau_samples < 1.0) tau_samples = 1.0;
     alpha_ = 1.0 / tau_samples;

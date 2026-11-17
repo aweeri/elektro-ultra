@@ -4,7 +4,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cli/options.h"
@@ -133,7 +137,6 @@ int run_decode(const Options& o) {
     TransportDemux transport;
     ProductWriter products;
     ProductStats pstats;
-    std::vector<XritBlob> blobs;
     std::string out_root = o.out;
     if (out_root.empty()) out_root = "out/" + capture_stem(path);
     products.configure(out_root, type, o.images);
@@ -153,7 +156,6 @@ int run_decode(const Options& o) {
     }
 
     std::vector<int8_t> soft;
-    std::vector<std::vector<uint8_t>> payloads;
     std::vector<cf> probe_buf;
     const size_t kProbeMax = 1u << 21;
     RunResult rr;
@@ -161,7 +163,49 @@ int run_decode(const Options& o) {
     Timer tick;
     const double max_s = o.max_seconds > 0 ? o.max_seconds : 0.0;
 
-    double t_demod = 0.0, t_fec = 0.0;
+    // FEC runs on its own thread: the demod is far heavier, so the vector decode rides
+    // along in the shadow of the front end instead of adding to the critical path.
+    std::mutex qm;
+    std::condition_variable q_ready, q_room;
+    std::deque<std::vector<int8_t>> q;
+    bool q_stop = false;
+
+    std::vector<std::vector<uint8_t>> payloads;
+    std::vector<XritBlob> blobs;
+    std::thread fec_thread([&] {
+        for (;;) {
+            std::vector<int8_t> job;
+            {
+                std::unique_lock<std::mutex> lk(qm);
+                q_ready.wait(lk, [&] { return q_stop || !q.empty(); });
+                if (q.empty()) {
+                    if (q_stop) return;
+                    continue;
+                }
+                job = std::move(q.front());
+                q.pop_front();
+            }
+            q_room.notify_one();
+
+            if (!job.empty()) {
+                payloads.clear();
+                fec.push(job.data(), job.size(), payloads);
+                for (const auto& p : payloads) {
+                    ++rr.payloads;
+                    blobs.clear();
+                    transport.push(p.data(), p.size(), blobs);
+                    for (const auto& b : blobs) products.push(b, pstats);
+                    if (cadu_dump) {
+                        const uint8_t len[2] = {(uint8_t)(p.size() & 0xFF),
+                                                (uint8_t)((p.size() >> 8) & 0xFF)};
+                        std::fwrite(len, 1, 2, cadu_dump);
+                        std::fwrite(p.data(), 1, p.size(), cadu_dump);
+                    }
+                }
+            }
+        }
+    });
+
     auto feed = [&](const cf* x, size_t n) {
         // Head of the capture, for a symbol-rate estimate that does not inherit the Gardner S-curve bias.
         if (probe_buf.size() < kProbeMax) {
@@ -169,29 +213,17 @@ int run_decode(const Options& o) {
             probe_buf.insert(probe_buf.end(), x, x + take);
         }
         soft.clear();
-        const auto t0 = std::chrono::steady_clock::now();
         demod.process(x, n, soft);
-        t_demod += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        const auto t1 = std::chrono::steady_clock::now();
-        if (!soft.empty()) {
-            rr.soft += soft.size();
-            if (soft_dump) std::fwrite(soft.data(), 1, soft.size(), soft_dump);
-            payloads.clear();
-            fec.push(soft.data(), soft.size(), payloads);
-            for (const auto& p : payloads) {
-                ++rr.payloads;
-                blobs.clear();
-                transport.push(p.data(), p.size(), blobs);
-                for (const auto& b : blobs) products.push(b, pstats);
-                if (cadu_dump) {
-                    const uint8_t len[2] = {(uint8_t)(p.size() & 0xFF),
-                                            (uint8_t)((p.size() >> 8) & 0xFF)};
-                    std::fwrite(len, 1, 2, cadu_dump);
-                    std::fwrite(p.data(), 1, p.size(), cadu_dump);
-                }
-            }
+        if (soft.empty()) return;
+        rr.soft += soft.size();
+        if (soft_dump) std::fwrite(soft.data(), 1, soft.size(), soft_dump);
+        {
+            std::unique_lock<std::mutex> lk(qm);
+            q_room.wait(lk, [&] { return q.size() < 4; });
+            q.push_back(std::move(soft));
+            soft = std::vector<int8_t>();
         }
-        t_fec += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+        q_ready.notify_one();
     };
 
     feed(buf.data(), got);
@@ -220,10 +252,16 @@ int run_decode(const Options& o) {
     soft.clear();
     demod.flush(soft);
     if (!soft.empty()) {
-        payloads.clear();
-        fec.push(soft.data(), soft.size(), payloads);
-        rr.payloads += payloads.size();
+        std::lock_guard<std::mutex> lk(qm);
+        q.push_back(std::move(soft));
+        q_ready.notify_one();
     }
+    {
+        std::lock_guard<std::mutex> lk(qm);
+        q_stop = true;
+    }
+    q_ready.notify_all();
+    fec_thread.join();
     if (soft_dump) std::fclose(soft_dump);
     products.flush(pstats);
     if (cadu_dump) std::fclose(cadu_dump);
@@ -280,7 +318,6 @@ int run_decode(const Options& o) {
             std::printf("%s %.2fs (%.0f%%)  ", names[i], t[i],
                         sum > 0 ? 100.0 * t[i] / sum : 0.0);
         std::printf("total %.2fs\n", sum);
-        std::printf("split      : demod %.2fs  fec+transport %.2fs  (rest: io/stats)\n", t_demod, t_fec);
     }
     std::printf("throughput : %.1fs of IQ in %.1fs (%.1fx realtime)\n", secs,
                 total.ms() / 1000.0, total.ms() > 0 ? secs / (total.ms() / 1000.0) : 0.0);
